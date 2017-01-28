@@ -1,100 +1,137 @@
 import tensorflow as tf
 import numpy as np
 import Audio
+from random import randint
+import time
 
-SAMPLESIZE = 5
+SAMPLESIZE = 25000
 NUMOUTPUTS = 256
-RESULT_LENGTH = 5
+RESULT_LENGTH = 100000
 
 
 
 class Net():
     def __init__(self, sampleSize):
-        #height is added to accomodate tensorflows lack of support for 1d atrous convolutions 
-        #height = 1
         numChannels = 1 
-        self.sampleSize = sampleSize
-        self.input = tf.placeholder(tf.float32, shape = [None,1, self.sampleSize, numChannels])
+        #self.sampleSize = sampleSize
+        
+                                                          #Variable sequence length
+        self.input = tf.placeholder(tf.float32, shape = [1, None, numChannels])
+        print(type(self.input))
         self.skips = []
         self.prevLayer = self.input
-        self.learningRate = 0.01
-
+        self.learningRate = 0.001
+        self.layerss = []
+        self.once = False
+        
+        
+        
     def _cust_atrous_conv2d(self, input, dialation,numFilters, name):
         with tf.variable_scope("atrous_"+str(name)) as scope:
-            const = tf.constant([0.0 for i in range(dialation)])
-            inputShape = int(input.get_shape()[-1]) * int(input.get_shape()[-2]) 
-            reshapedInput = tf.reshape(input,(inputShape,))
-            concated = tf.slice(tf.concat(0,[const, reshapedInput]), [0],[self.sampleSize])
-            stacked = tf.concat(3,[tf.reshape(concated,shape=(-1,1,self.sampleSize, 1)), input])
-            stacked = tf.concat(3, [stacked for i in range(int(inputShape))])
-            _,_,_,prevChannels = stacked.get_shape()
-            output = tf.nn.conv2d(stacked, self._weight_variable([1,1,int(prevChannels),numFilters]), strides=[1,1,1,1], padding = "SAME")
-            return output
+            print(input.get_shape())
+            if(not self.once):
+                inputFilters = 1
+                self.once = True
+            else:
+                inputFilters = 128   
+                
+            out = self.causal_conv(input, self._weight_variable([2, inputFilters, numFilters]), dialation)
+            return out
+        
+    def time_to_batch(self,value, dilation, name='time_to_batch'):
+        with tf.name_scope(name):
+            shape = tf.shape(value)
+            pad_elements = dilation - 1 - (shape[1] + dilation - 1) % dilation
+            padded = tf.pad(value, [[0, 0], [0, pad_elements], [0, 0]])
+            reshaped = tf.reshape(padded, [-1, dilation, shape[2]])
+            transposed = tf.transpose(reshaped, perm=[1, 0, 2])
+            return tf.reshape(transposed, [shape[0] * dilation, -1, shape[2]])
+
+    def batch_to_time(self,value, dilation, name='batch_to_time'):
+        with tf.name_scope(name):
+            shape = tf.shape(value)
+            prepared = tf.reshape(value, [dilation, -1, shape[2]])
+            transposed = tf.transpose(prepared, perm=[1, 0, 2])
+            return tf.reshape(transposed,
+                              [tf.div(shape[0], dilation), -1, shape[2]])
+        
+    def causal_conv(self,value, filter_, dilation, name='causal_conv'):
+        with tf.name_scope(name):
+
+            padding = [[0, 0], [dilation, 0], [0, 0]]
+            padded = tf.pad(value, padding)
+            if dilation > 1:
+                transformed = self.time_to_batch(padded, dilation)
+                conv = tf.nn.conv1d(transformed, filter_, stride=1, padding='SAME')
+                restored = self.batch_to_time(conv, dilation)
+            else:
+                restored = tf.nn.conv1d(padded, filter_, stride=1, padding='SAME')
+                
+            result = tf.slice(restored,
+                              [0, 0, 0],
+                              [-1, tf.shape(value)[1], -1])
+            return result
+      
         
     def _weight_variable(self,shape):
-        #Set to 2 for testing (makes it easy to verify result using hand calculations)
-        initial = tf.truncated_normal(shape, stddev=0.1) #tf.mul(tf.ones(shape),2)    #
+        initial = tf.truncated_normal(shape, stddev=0.1)
         return tf.Variable(initial)
     
-    def _residualBlock(self, input, dialation,numFilters, name):
-        dialatedConvSig = tf.nn.sigmoid(self._cust_atrous_conv2d(input, dialation,numFilters, name))
-        dialatedConvTan = tf.nn.tanh(self._cust_atrous_conv2d(input, dialation,numFilters, name))
-        combined = tf.mul(dialatedConvSig,dialatedConvTan)
-        print(combined)
-        skipConnection = tf.nn.conv2d(combined, self._weight_variable([1,1,int(combined.get_shape()[-1]),numFilters]), strides=[1,1,1,1],padding = "SAME")    
-        residual = skipConnection + input
-        self.skips.append(skipConnection)
-        return [residual, skipConnection]
+    def _residualBlock(self, input, dialation,numFilters, name='_residualBlock'):
+        with tf.name_scope(name):
+            dialatedConvSig = tf.nn.sigmoid(self._cust_atrous_conv2d(input, dialation,numFilters, name))
+            dialatedConvTan = tf.nn.tanh(self._cust_atrous_conv2d(input, dialation,numFilters, name))
+            combined = tf.mul(dialatedConvSig,dialatedConvTan)
+            skipConnection     = tf.nn.conv1d(combined, self._weight_variable([1,128,numFilters]), stride=1,padding = "SAME")
+            residualConnection = tf.nn.conv1d(combined, self._weight_variable([1,128,numFilters]), stride=1, padding = "SAME")     
+            residual = residualConnection + input
+            self.skips.append(skipConnection)
+            return [residual, skipConnection]
         
-    def _calculateOutput(self, skipConnections,numFilters):
-        activatedSum = tf.nn.relu(tf.reduce_sum(skipConnections, axis=0))
-        conv1 = tf.nn.conv2d(activatedSum, self._weight_variable([1,1,int(activatedSum.get_shape()[-1]),numFilters]), strides = [1,1,1,1], padding = "SAME")
-        conv1Activated = tf.nn.relu(conv1)
-        conv2 = tf.nn.conv2d(conv1Activated, self._weight_variable([1,1,int(conv1Activated.get_shape()[-1]), numFilters]), strides = [1,1,1,1], padding = "SAME")
-        fc = tf.reshape(conv2, [SAMPLESIZE, -1])
+    def _calculateOutput(self, skipConnections,numFilters, name='_calcOutut'):
+        with tf.name_scope(name):
+            activatedSum = tf.nn.relu(tf.reduce_sum(skipConnections, axis=0))
+            conv1 = tf.nn.conv1d(activatedSum, self._weight_variable([1,128,numFilters]), stride = 1, padding = "SAME")
+            conv1Activated = tf.nn.relu(conv1)
+            conv2 = tf.nn.conv1d(conv1Activated, self._weight_variable([1,128, NUMOUTPUTS]), stride = 1, padding = "SAME")
+            out = tf.reshape(conv2, [-1,256])
+            #fc = tf.reshape(conv2, [SAMPLESIZE, -1])
+            
+            #weights = self._weight_variable([128,NUMOUTPUTS])
+            #out =  tf.matmul(fc,weights)#tf.nn.softmax(tf.matmul(fc, weights))
+            
+            return out
         
-        
-        weights = self._weight_variable([int(fc.get_shape()[-1]),NUMOUTPUTS])
-        soft =  tf.nn.softmax(tf.matmul(fc, weights))
-        print("SOFT SHAPE:")
-        print(soft.get_shape())
-        return soft
-        
-        
-    def _addLayer(self, prevLayer,dialation):
-        self.prevLayer, _ = net._residualBlock(prevLayer, dialation=dialation,numFilters = 128, name="l2")
+         
+    def _addLayer(self, prevLayer,dialation, numfilters):
+        self.prevLayer, _ = net._residualBlock(prevLayer, dialation=dialation,numFilters = numfilters, name="l2")
         
         
     def build(self, layers):
-        #First causal (non dialeted) layer. Does not participate in residual block
-        self.prevLayer = tf.nn.relu(net._cust_atrous_conv2d(self.prevLayer, dialation=1,numFilters=128,name="name"))
-        for i in range(layers):
-            #All other layers consist of residual blocks (except output)
-            self._addLayer(self.prevLayer,2**i)
-        #Generate output layer
-        output = net._calculateOutput(self.skips, 128)
-        print("OUTPUT SHAPE:")
-        print(output.get_shape())
-        return output
+        with tf.variable_scope("trainNet") as scope:
+            #First causal (non dialeted) layer. Does not participate in residual block
+            self.prevLayer = tf.nn.relu(net._cust_atrous_conv2d(self.prevLayer, dialation=1,numFilters=128,name="name"))
+            for i in range(layers):
+                #All other layers consist of residual blocks (except output)
+                self._addLayer(self.prevLayer,2**i, 128)
+            #Generate output layer
+            output = net._calculateOutput(self.skips, 128)
+            return output
     
     def _getLoss(self, output, answers):
-        print("___________________________")
-        print(output.get_shape())
-        print(answers.get_shape())
-        print("___________________________")
         return tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(labels=answers,logits=output))
     
     def getUpdateOp(self, output, answers):
         loss = self._getLoss(output, answers)    
         optimizer = tf.train.AdamOptimizer(self.learningRate)
-        grads = optimizer.compute_gradients(loss, tf.trainable_variables())
+        grads = optimizer.compute_gradients(loss, tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='trainNet'))
         return [optimizer.apply_gradients(grads),loss] #[optimizer.apply_gradients(grads), loss, grads]
         
         
-        
 
+    
 net = Net(SAMPLESIZE)
-output = net.build(5)
+output = net.build(13)
 answerPH = tf.placeholder(tf.int32, [SAMPLESIZE])
 lossOp, loss = net.getUpdateOp(output, answerPH)
 
@@ -104,36 +141,70 @@ lossOp, loss = net.getUpdateOp(output, answerPH)
 
 with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
-    for i in range(151):
+    sample = Audio.getSample()
+    for i in range(2001):
 
-        result = sess.run(lossOp, feed_dict={net.input:np.array(Audio.getSample()[0][:SAMPLESIZE]).reshape(1,1,SAMPLESIZE,1), answerPH:np.array(Audio.getSample()[0][1:(SAMPLESIZE+1)]).reshape(SAMPLESIZE)})
+        result = sess.run(lossOp, feed_dict={net.input:np.array(Audio.getSample()[0][:SAMPLESIZE]).reshape(1,SAMPLESIZE,1), answerPH:np.array(sample[0][1:(SAMPLESIZE+1)]).reshape(SAMPLESIZE)})
+        #result = sess.run(lossOp, feed_dict={net.input:np.array(Audio.getSample()[0][1000:(SAMPLESIZE+1000)]).reshape(1,SAMPLESIZE,1), answerPH:np.array(Audio.getSample()[0][1001:(SAMPLESIZE+1001)]).reshape(SAMPLESIZE)})
+        #result = sess.run(lossOp, feed_dict={net.input:np.array(Audio.getSample()[0][2000:(SAMPLESIZE+2000)]).reshape(1,SAMPLESIZE,1), answerPH:np.array(Audio.getSample()[0][2001:(SAMPLESIZE+2001)]).reshape(SAMPLESIZE)})
+        #result = sess.run(lossOp, feed_dict={net.input:np.array(Audio.getSample()[0][3000:(SAMPLESIZE+3000)]).reshape(1,SAMPLESIZE,1), answerPH:np.array(Audio.getSample()[0][3001:(SAMPLESIZE+3001)]).reshape(SAMPLESIZE)})
         if(i%10 ==0):
             
-            error = sess.run(loss, feed_dict={net.input:np.array(Audio.getSample()[0][:SAMPLESIZE]).reshape(1,1,SAMPLESIZE,1), answerPH:np.array(Audio.getSample()[0][1:(SAMPLESIZE+1)]).reshape(SAMPLESIZE)})
+            error = sess.run(loss, feed_dict={net.input:np.array(sample[0][:SAMPLESIZE]).reshape(1,SAMPLESIZE,1), answerPH:np.array(sample[0][1:(SAMPLESIZE+1)]).reshape(SAMPLESIZE)})
             print("Error : %s | Iteration %s"%(error, i))
     
-    result = sess.run(output, feed_dict={net.input:np.array(Audio.getSample()[0][:SAMPLESIZE]).reshape(1,1,SAMPLESIZE,1)})
-    for e, f in zip(result,np.array(Audio.getSample()[0][:SAMPLESIZE]).reshape(SAMPLESIZE) ):
+    result = sess.run(output, feed_dict={net.input:np.array(sample[0][:SAMPLESIZE]).reshape(1,SAMPLESIZE,1)})
+    print("RESULT SHAPE:")
+    print(result.shape)
+    for e, f in zip(result,np.array(Audio.getSample()[0][1:(SAMPLESIZE+1)]).reshape(SAMPLESIZE) ):
         print(np.argmax(e,axis=0))
         print(f)
         print("+======+")
-        
-        
+       
+    print("EEEENNNNNDDDDD") 
 
+
+        
+        
     
     
-## Create a new net with persisted weights to predict on a different length sample
-def zeroFill(prevPreds):
-## Testing the result:
-    #Temporary, to make sure its doing its job
-    #every 2*training sequence, split it in half and save the result 
-    if(testing):
-        prevPreds = []
-        for iter in range(RESULT_LENGTH):
-            result = sess.run(output, feed_dict=np.concat(prevPreds, np.zeros(RESULT_LENGTH-(iter+1))))
-            prevPreds = result[:iter]
+    
+    seed = randint(115,116)
+    results = []
+    
+    for timeStep in range(RESULT_LENGTH):
+        start = time.time()
+        if(timeStep == 0):
+            example = np.array(seed).reshape(1,-1,1)
+        else:
+            example = results[-SAMPLESIZE:]    
+            example = np.array(example).reshape(1,-1,1)
             
         
+            
+        endPrep =  time.time() - start
+        startRun = time.time()
+        result = sess.run(output, feed_dict={net.input:example})
+        results.append(np.argmax(result, axis = 1)[-1])
+        
+        endAll = time.time() - start
+        endRun = time.time() - startRun 
+        if(timeStep % 50 == 0 ):
+            print("Step %s/%s | Time(all) %s | Time(prep) %s | Time(run) %s"%(timeStep,RESULT_LENGTH, endAll, endPrep, endRun))
+        
+        
+    Audio.writeSample("testing123.wav",  np.array(results).reshape(-1))
+    
+    
+    
+    
+    
+
+
+
+
+
+
 
     
     
